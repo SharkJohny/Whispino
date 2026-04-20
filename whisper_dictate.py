@@ -450,13 +450,19 @@ class Dictation(rumps.App):
     def _on_press(self, key) -> None:
         if key != resolve_hotkey(self.cfg["hotkey"]):
             return
-        with self._lock:
-            if not self._recording:
-                self._start()
+        threading.Thread(target=self._do_start, daemon=True).start()
 
     def _on_release(self, key) -> None:
         if key != resolve_hotkey(self.cfg["hotkey"]):
             return
+        threading.Thread(target=self._do_stop, daemon=True).start()
+
+    def _do_start(self) -> None:
+        with self._lock:
+            if not self._recording:
+                self._start()
+
+    def _do_stop(self) -> None:
         with self._lock:
             if self._recording:
                 self._stop_and_transcribe()
@@ -502,10 +508,13 @@ class Dictation(rumps.App):
     def _stop_and_transcribe(self) -> None:
         self._recording = False
         duration = time.monotonic() - self._start_ts
-        assert self._stream is not None
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as exc:
+                print(f"[warn] stream stop failed: {exc}", flush=True)
+            self._stream = None
         self._current_level = 0.0
         if self.cfg["play_sounds"]:
             play_sound(STOP_SOUND)
