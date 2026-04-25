@@ -43,10 +43,21 @@ pip install -r requirements.txt
 
 ## Spuštění (dev)
 
+**Pokaždé, když otevřeš nový terminál**, musíš se nejdřív přepnout do projektu a aktivovat venv:
+
 ```sh
+cd ~/Dev/sandbox/whisper
 source .venv/bin/activate
 python whisper_dictate.py
 ```
+
+Poznáš to podle promptu — z `sharkjohny@MacBook ~ %` se změní na `(.venv) sharkjohny@MacBook whisper %`. Až pak `python` ukazuje na ten správný interpreter s nainstalovanými balíky (`mlx_whisper`, `rumps`, …).
+
+Běžné chyby, když jeden z kroků vynecháš:
+
+- `source: no such file or directory: .venv/bin/activate` → zapomněl jsi `cd` do projektu
+- `zsh: command not found: python` → máš jen `python3` a nemáš aktivovaný venv
+- `ModuleNotFoundError: No module named 'mlx_whisper'` → nepustil jsi to z venvu
 
 Při prvním spuštění:
 

@@ -18,6 +18,7 @@ import time
 import mlx_whisper
 import numpy as np
 import objc
+import Quartz
 import rumps
 import sounddevice as sd
 from AppKit import (
@@ -131,6 +132,14 @@ def play_sound(path: str) -> None:
     )
 
 
+def _close_stream_safely(stream) -> None:
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as exc:
+        print(f"[warn] stream close failed: {exc!r}", flush=True)
+
+
 def _osascript(script: str, timeout: float = 1.0) -> str | None:
     try:
         r = subprocess.run(
@@ -163,6 +172,20 @@ def pause_playing_media() -> list[str]:
 def resume_media(apps: list[str]) -> None:
     for app in apps:
         _osascript(f'tell application "{app}" to play')
+
+
+def type_text_unicode(text: str) -> None:
+    """Type text by posting CGEvents with unicode strings (bypasses keycode/layout)."""
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    for char in text:
+        utf16 = char.encode("utf-16-le")
+        length = len(utf16) // 2
+        down = Quartz.CGEventCreateKeyboardEvent(src, 0, True)
+        Quartz.CGEventKeyboardSetUnicodeString(down, length, char)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        up = Quartz.CGEventCreateKeyboardEvent(src, 0, False)
+        Quartz.CGEventKeyboardSetUnicodeString(up, length, char)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
 # ---- Login Item helpers --------------------------------------------------
@@ -324,6 +347,8 @@ class Dictation(rumps.App):
         self._current_level = 0.0
         self._target_app = None
         self._paused_media: list[str] = []
+        self._transcribe_lock = threading.Lock()
+        self._model_ready = threading.Event()
 
         self._overlay, self._wave = make_overlay()
         self._build_menu()
@@ -434,15 +459,18 @@ class Dictation(rumps.App):
     def _warmup(self) -> None:
         self.title = "⏳"
         self._download_model(self.cfg["model"])
+        self._model_ready.set()
+        print("[warmup] model ready", flush=True)
 
     def _download_model(self, repo: str) -> None:
         try:
             silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
-            mlx_whisper.transcribe(
-                silent,
-                path_or_hf_repo=repo,
-                language=self.cfg["language"],
-            )
+            with self._transcribe_lock:
+                mlx_whisper.transcribe(
+                    silent,
+                    path_or_hf_repo=repo,
+                    language=self.cfg["language"],
+                )
         finally:
             AppHelper.callAfter(lambda: setattr(self, "title", "🎙"))
 
@@ -459,8 +487,12 @@ class Dictation(rumps.App):
 
     def _do_start(self) -> None:
         with self._lock:
-            if not self._recording:
-                self._start()
+            if self._recording:
+                return
+            if self._transcribe_lock.locked():
+                print("[hotkey] previous transcription still running — ignoring press", flush=True)
+                return
+            self._start()
 
     def _do_stop(self) -> None:
         with self._lock:
@@ -508,13 +540,16 @@ class Dictation(rumps.App):
     def _stop_and_transcribe(self) -> None:
         self._recording = False
         duration = time.monotonic() - self._start_ts
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception as exc:
-                print(f"[warn] stream stop failed: {exc}", flush=True)
-            self._stream = None
+        stream = self._stream
+        self._stream = None
+        # Close the audio device off the hot path — it can block for 200-500 ms
+        # on macOS while CoreAudio flushes, and we don't want that holding the lock.
+        if stream is not None:
+            threading.Thread(
+                target=_close_stream_safely,
+                args=(stream,),
+                daemon=True,
+            ).start()
         self._current_level = 0.0
         if self.cfg["play_sounds"]:
             play_sound(STOP_SOUND)
@@ -545,16 +580,37 @@ class Dictation(rumps.App):
 
     # ---- Transcription + paste -------------------------------------------
     def _transcribe(self, audio: np.ndarray) -> None:
+        t0 = time.monotonic()
+        if not self._model_ready.is_set():
+            print("[transcribe] waiting for model warmup…", flush=True)
+            self._model_ready.wait()
+        acquired = self._transcribe_lock.acquire(timeout=30.0)
+        if not acquired:
+            print("[transcribe] timed out waiting for previous run; skipping", flush=True)
+            AppHelper.callAfter(self._ui_idle)
+            return
         try:
+            print(
+                f"[transcribe] running on {len(audio) / SAMPLE_RATE:.1f}s of audio",
+                flush=True,
+            )
             result = mlx_whisper.transcribe(
                 audio,
                 path_or_hf_repo=self.cfg["model"],
                 language=self.cfg["language"],
             )
             text = (result.get("text") or "").strip()
+            print(
+                f"[transcribe] done in {time.monotonic() - t0:.1f}s: "
+                f"{text[:60]!r}{'…' if len(text) > 60 else ''}",
+                flush=True,
+            )
             if text:
                 self._deliver(text)
+        except Exception as exc:
+            print(f"[transcribe] failed: {exc!r}", flush=True)
         finally:
+            self._transcribe_lock.release()
             AppHelper.callAfter(self._ui_idle)
             apps = self._paused_media
             self._paused_media = []
